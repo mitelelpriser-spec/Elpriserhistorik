@@ -10,8 +10,10 @@ Kun Python 3.9+ standardbibliotek.
 """
 import json
 import os
+import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -47,15 +49,30 @@ def fetch_rows(area, start_utc, end_utc):
     }
     url = API + "?" + urllib.parse.urlencode(q)
     last = None
-    for attempt in range(4):
+    for attempt in range(8):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "elpris-data-script"})
             with urllib.request.urlopen(req, timeout=90) as r:
                 recs = json.load(r)["records"]
             break
+        except urllib.error.HTTPError as e:
+            last = e
+            wait = 10 * (attempt + 1)
+            if e.code == 429:
+                # "Rate limit is exceeded. Try again in X seconds." - vent så længe, de beder om
+                try:
+                    body = e.read().decode("utf-8", "ignore")
+                    m = re.search(r"(\d+)\s*second", body)
+                    ra = e.headers.get("Retry-After")
+                    wait = int(m.group(1)) + 2 if m else (int(ra) + 2 if ra and ra.isdigit() else 30)
+                except Exception:  # noqa: BLE001
+                    wait = 30
+                wait = min(max(wait, 5), 120)
+            print(f"  {area}: HTTP {e.code}, venter {wait} s", flush=True)
+            time.sleep(wait)
         except Exception as e:  # noqa: BLE001
             last = e
-            time.sleep(5 * (attempt + 1))
+            time.sleep(10 * (attempt + 1))
     else:
         raise RuntimeError(f"Kunne ikke hente {area}: {last}")
     rows = []
@@ -117,28 +134,36 @@ def main():
     written = []
     for area in AREAS:
         os.makedirs(os.path.join(OUT, area), exist_ok=True)
+        todo = []
         for (y, m) in months:
             path = os.path.join(OUT, area, f"{y}-{m:02d}.json")
             start, end = month_bounds(y, m)
             n = int((end - start) / STEP)
             if (y, m) not in recent and is_complete(path, n):
                 written.append(f"{area}/{y}-{m:02d}")
+            else:
+                todo.append((y, m, path, start, end, n))
+        if not todo:
+            continue
+        # Alle manglende måneder hentes i ÉN forespørgsel pr. område og deles op bagefter (skåner API'et)
+        try:
+            all_rows = fetch_rows(area, todo[0][3], todo[-1][4])
+        except Exception as e:  # noqa: BLE001
+            failures += len(todo)
+            print(f"FEJL {area}: {e}", file=sys.stderr)
+            continue
+        for (y, m, path, start, end, n) in todo:
+            rows = [r for r in all_rows if start <= r[0] < end]
+            if not rows:
+                print(f"{area} {y}-{m:02d}: ingen data (springes over)")
                 continue
-            try:
-                rows = fetch_rows(area, start, end)
-                if not rows:
-                    print(f"{area} {y}-{m:02d}: ingen data (springes over)")
-                    continue
-                arr = build_slots(rows, start, end)
-                doc = {"area": area, "month": f"{y}-{m:02d}", "startUtc": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "step": 15, "v": arr}
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(doc, f, separators=(",", ":"))
-                written.append(f"{area}/{y}-{m:02d}")
-                print(f"{area} {y}-{m:02d}: {sum(x is not None for x in arr)}/{n} kvarter")
-            except Exception as e:  # noqa: BLE001
-                failures += 1
-                print(f"FEJL {area} {y}-{m:02d}: {e}", file=sys.stderr)
-            time.sleep(1)
+            arr = build_slots(rows, start, end)
+            doc = {"area": area, "month": f"{y}-{m:02d}", "startUtc": start.strftime("%Y-%m-%dT%H:%M:%SZ"), "step": 15, "v": arr}
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f, separators=(",", ":"))
+            written.append(f"{area}/{y}-{m:02d}")
+            print(f"{area} {y}-{m:02d}: {sum(x is not None for x in arr)}/{n} kvarter")
+        time.sleep(5)
     index = {"updated": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "areas": AREAS, "months": [f"{y}-{m:02d}" for y, m in months]}
     # index.json ændres kun, når listen over måneder ændrer sig – så der ikke laves en ny version hver time
     idx_path = os.path.join(OUT, "index.json")
@@ -151,7 +176,10 @@ def main():
     if not old or old.get("months") != index["months"]:
         with open(idx_path, "w", encoding="utf-8") as f:
             json.dump(index, f, separators=(",", ":"))
-    return 1 if failures else 0
+    if failures:
+        print(f"ADVARSEL: {failures} måned(er) kunne ikke hentes; de tages ved næste kørsel.", file=sys.stderr)
+    # Delvist resultat er fint (færdige måneder springes over næste gang). Kun fejl hvis intet lykkedes.
+    return 1 if failures and not written else 0
 
 
 if __name__ == "__main__":
