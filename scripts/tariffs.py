@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+Henter tariffer og afgifter fra Energi Data Service (DatahubPricelist) – skånsomt, ét netselskab ad gangen:
+
+    data/grids.json                 liste over netselskaber (GLN, kode, navn, beskrivelse)
+    data/tariffs/<GLN>.json         netselskabets C-tarif-rækker
+    data/tariffs/energinet.json     Energinets transmissions- og systemtarif og elafgiften
+
+Hver række: {"code": "CD", "from": "2025-01-01T00:00:00", "to": null, "p": [24 timepriser i DKK/kWh ekskl. moms]}.
+Første gang hentes 2 år tilbage; derefter højst hver 6. dag pr. fil, kun 60 dage tilbage, flettet ind i de gemte rækker.
+Altid 120 dage frem. Pause mellem opslag, og scriptet stopper pænt efter en tidsgrænse (resten tages næste kørsel).
+Kun Python 3.9+ standardbibliotek.
+"""
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+API = "https://api.energidataservice.dk/dataset/DatahubPricelist"
+ENERGINET_GLN = "5790000432752"
+EN_CODES = ["EA-001", "40000", "41000"]
+OUT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
+BACK_FULL = 730         # første gang: 2 år tilbage
+BACK_INC = 60           # senere: kun 60 dage tilbage
+AHEAD = 120
+REFRESH_H = 6 * 24      # hver fil opdateres højst hver 6. dag
+SLEEP = 10.0            # pause mellem opslag
+BUDGET_S = 28 * 60      # stop pænt efter 28 minutter
+
+
+def http_json(url):
+    last = None
+    for attempt in range(6):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "elpris-data-script"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            last = e
+            wait = 10 * (attempt + 1)
+            if e.code == 429:
+                try:
+                    body = e.read().decode("utf-8", "ignore")
+                    m = re.search(r"(\d+)\s*second", body)
+                    ra = e.headers.get("Retry-After")
+                    wait = int(m.group(1)) + 2 if m else (int(ra) + 2 if ra and ra.isdigit() else 30)
+                except Exception:  # noqa: BLE001
+                    wait = 30
+                wait = min(max(wait, 5), 120)
+            print(f"  HTTP {e.code}, venter {wait} s", flush=True)
+            time.sleep(wait)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            time.sleep(10 * (attempt + 1))
+    raise RuntimeError(f"Kunne ikke hente: {last}")
+
+
+def query(filter_dict, back, columns=None, limit=100000):
+    today = datetime.now(timezone.utc).date()
+    q = {
+        "start": f"{today - timedelta(days=back)}T00:00",
+        "end": f"{today + timedelta(days=AHEAD)}T00:00",
+        "filter": json.dumps(filter_dict),
+        "timezone": "dk",
+        "limit": str(limit),
+    }
+    if columns:
+        q["columns"] = columns
+    return http_json(API + "?" + urllib.parse.urlencode(q))["records"]
+
+
+def prices24(rec):
+    out = []
+    p1 = rec.get("Price1")
+    for h in range(1, 25):
+        v = rec.get(f"Price{h}")
+        if v is None:
+            v = p1 if p1 is not None else 0.0   # flad takst: Price1 gælder alle timer
+        out.append(round(float(v), 6))
+    return out
+
+
+def to_row(rec):
+    vf = rec.get("ValidFrom")
+    if not vf:
+        return None
+    vt = rec.get("ValidTo")
+    return {"code": str(rec.get("ChargeTypeCode", "")).strip(), "from": str(vf)[:19],
+            "to": str(vt)[:19] if vt else None, "p": prices24(rec)}
+
+
+def parse_dt(s):
+    s = s.strip()[:19]
+    return datetime.fromisoformat(s if len(s) > 10 else s + "T00:00:00")
+
+
+def covers_now(rows, code=None):
+    now = datetime.now()
+    cand = [r for r in rows if (code is None or r["code"].lower() == code.lower()) and parse_dt(r["from"]) <= now]
+    if not cand:
+        return False
+    r = max(cand, key=lambda x: parse_dt(x["from"]))
+    return r["to"] is None or now < parse_dt(r["to"])
+
+
+def merge(old, new):
+    d = {(r["code"].lower(), r["from"]): r for r in old}
+    for r in new:
+        d[(r["code"].lower(), r["from"])] = r
+    return sorted(d.values(), key=lambda r: (r["code"], r["from"]))
+
+
+def build_grids(recs):
+    """Samme regler som appen: noten skal indeholde 'nettarif c', gældende nu; nyeste række pr. (GLN, kode)."""
+    now = datetime.now()
+    best = {}
+    for o in recs:
+        vf = o.get("ValidFrom")
+        if not vf:
+            continue
+        note = str(o.get("Note") or "").strip().lower()
+        if "nettarif c" not in note:
+            continue
+        gln = str(o.get("GLN_Number") or "")
+        code = str(o.get("ChargeTypeCode") or "").strip()
+        if not gln or not code:
+            continue
+        frm = parse_dt(str(vf))
+        if frm > now:
+            continue
+        to = parse_dt(str(o["ValidTo"])) if o.get("ValidTo") else None
+        key = (gln, code)
+        old = best.get(key)
+        if old is None or frm > old["from"]:
+            best[key] = {"from": frm, "to": to, "gln": gln, "code": code,
+                         "name": (str(o.get("ChargeOwner") or "").strip() or gln),
+                         "desc": str(o.get("Description") or "").strip()}
+    out = [b for b in best.values() if b["to"] is None or b["to"] > now]
+    out.sort(key=lambda b: b["name"].lower())
+    return [{"gln": b["gln"], "code": b["code"], "name": b["name"], "desc": b["desc"]} for b in out]
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, separators=(",", ":"))
+
+
+def age_hours(obj):
+    try:
+        upd = datetime.strptime(obj["updated"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - upd).total_seconds() / 3600
+    except Exception:  # noqa: BLE001
+        return 1e9
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def main():
+    t0 = time.time()
+    tdir = os.path.join(OUT, "tariffs")
+    grids_path = os.path.join(OUT, "grids.json")
+    gj = read_json(grids_path)
+    first_request = True
+
+    def pause():
+        nonlocal first_request
+        if not first_request:
+            time.sleep(SLEEP)
+        first_request = False
+
+    # 1) netselskabslisten (kun hvis den mangler eller er over 6 dage gammel)
+    if gj and age_hours(gj) < REFRESH_H and len(gj.get("grids", [])) >= 10:
+        grids = gj["grids"]
+        print(f"Netselskabslisten er frisk ({len(grids)} koder).", flush=True)
+    else:
+        print("Henter netselskaber …", flush=True)
+        pause()
+        meta = query({"ChargeType": ["D03"]}, BACK_FULL, columns="GLN_Number,ChargeOwner,ChargeTypeCode,Note,Description,ValidFrom,ValidTo")
+        grids = build_grids(meta)
+        if len(grids) < 10:
+            raise RuntimeError(f"Kun {len(grids)} netselskaber fundet – dataene ser forkerte ud, springer over.")
+        write_json(grids_path, {"updated": now_iso(), "grids": grids})
+        print(f"  {len(grids)} netselskaber (koder).", flush=True)
+
+    # 2) Energinet + hvert netselskab, ét opslag ad gangen
+    jobs = [(ENERGINET_GLN, EN_CODES, os.path.join(tdir, "energinet.json"), "Energinet")]
+    by_gln = {}
+    names = {}
+    for g in grids:
+        by_gln.setdefault(g["gln"], []).append(g["code"])
+        names[g["gln"]] = g["name"]
+    for gln, codes in by_gln.items():
+        jobs.append((gln, codes, os.path.join(tdir, f"{gln}.json"), names[gln]))
+
+    done = skipped = 0
+    failed = []
+    for gln, codes, path, name in jobs:
+        ex = read_json(path)
+        old_rows = ex.get("rows", []) if ex else []
+        have_all = all(any(r["code"].lower() == c.lower() for r in old_rows) for c in codes)
+        if ex and have_all and age_hours(ex) < REFRESH_H and all(covers_now(old_rows, c) for c in codes):
+            skipped += 1
+            continue
+        if time.time() - t0 > BUDGET_S:
+            failed.append(f"{name}: tidsgrænse nået – tages næste kørsel")
+            continue
+        pause()
+        try:
+            recs = query({"GLN_Number": [gln], "ChargeTypeCode": codes}, BACK_INC if have_all else BACK_FULL)
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{name}: {e}")
+            continue
+        new_rows = [r for r in (to_row(x) for x in recs) if r]
+        rows = merge(old_rows, new_rows)
+        if not rows:
+            failed.append(f"{name}: ingen rækker")
+            continue
+        write_json(path, {"gln": gln, "updated": now_iso(), "rows": rows})
+        done += 1
+        print(f"  {name}: {len(rows)} rækker", flush=True)
+
+    print(f"Hentet {done}, sprunget over {skipped}, mislykket {len(failed)} (af {len(jobs)}).")
+    for f in failed:
+        print("ADVARSEL:", f, file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
