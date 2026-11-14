@@ -176,6 +176,12 @@ def main():
     if not old or old.get("months") != index["months"]:
         with open(idx_path, "w", encoding="utf-8") as f:
             json.dump(index, f, separators=(",", ":"))
+    # Tariffer og afgifter (højst én gang i døgnet); fejl her må ikke vælte spotpriserne
+    try:
+        import tariffs
+        tariffs.main()
+    except Exception as e:  # noqa: BLE001
+        print(f"ADVARSEL tariffer: {e}", file=sys.stderr)
     if failures:
         print(f"ADVARSEL: {failures} måned(er) kunne ikke hentes; de tages ved næste kørsel.", file=sys.stderr)
     # Delvist resultat er fint (færdige måneder springes over næste gang). Kun fejl hvis intet lykkedes.
