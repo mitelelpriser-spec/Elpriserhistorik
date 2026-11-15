@@ -28,7 +28,7 @@ OUT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 BACK_FULL = 3650        # første gang pr. selskab: langt tilbage, for DataHub søger på startdato og den gældende række kan være gammel
 KEEP_DAYS = 800         # gemte rækker, der sluttede for mere end 800 dage siden, kasseres
 META_BACK = 3650        # netselskabslisten bygges ud fra rækker op til 10 år tilbage
-GRIDS_VERSION = 3       # hæves, når listereglerne ændres (tvinger ny liste)
+GRIDS_VERSION = 5       # hæves, når listereglerne ændres (tvinger ny liste)
 BACK_INC = 60           # senere: kun 60 dage tilbage
 AHEAD = 120
 REFRESH_H = 6 * 24      # hver fil opdateres højst hver 6. dag
@@ -118,6 +118,12 @@ def merge(old, new):
     return sorted(d.values(), key=lambda r: (r["code"], r["from"]))
 
 
+def is_c_note(note):
+    """Noten (små bogstaver) peger på en C-tarif: 'Nettarif C …', 'C-Kunde Nettarif', 'C-tarif' osv."""
+    return "nettarif c" in note or "c-kunde" in note or "c kunde" in note or "c-tarif" in note \
+        or "0-100000kwh" in note.replace(".", "").replace(" ", "")   # Hurup Elværk: C-kunder = forbrug 0-100.000 kWh
+
+
 def build_grids(recs):
     """Samme regler som appen: noten skal indeholde 'nettarif c', gældende nu; nyeste række pr. (GLN, kode)."""
     now = datetime.now()
@@ -127,7 +133,7 @@ def build_grids(recs):
         if not vf:
             continue
         note = str(o.get("Note") or "").strip().lower()
-        if "nettarif c" not in note:
+        if not is_c_note(note) or "sanity" in str(o.get("ChargeOwner") or "").lower():
             continue
         gln = str(o.get("GLN_Number") or "")
         code = str(o.get("ChargeTypeCode") or "").strip()
@@ -162,16 +168,23 @@ def diagnose(recs, grids):
         gln = str(o.get("GLN_Number") or "")
         if not gln or gln in have or gln == ENERGINET_GLN:
             continue
-        d = owners.setdefault(gln, {"name": str(o.get("ChargeOwner") or "").strip(), "notes": {}})
+        d = owners.setdefault(gln, {"name": str(o.get("ChargeOwner") or "").strip(), "notes": {}, "last": ""})
+        if not d["name"]:
+            d["name"] = str(o.get("ChargeOwner") or "").strip()
         n = str(o.get("Note") or "").strip()
         d["notes"][n] = d["notes"].get(n, 0) + 1
+        if is_c_note(n.lower()):   # hvornår udløb den seneste C-række? (ingen = åben)
+            vt = str(o.get("ValidTo") or "åben")[:10]
+            if d["last"] == "" or vt == "åben" or (d["last"] != "åben" and vt > d["last"]):
+                d["last"] = vt
     if not owners:
         print("  Alle selskaber med takstposter er med på listen.", flush=True)
         return
     print(f"  UDELADT fra listen ({len(owners)} selskaber har takstposter, men ingen 'Nettarif C'):", flush=True)
     for gln, d in sorted(owners.items(), key=lambda kv: kv[1]["name"].lower()):
         notes = ", ".join(f"{k or '(tom)'}×{v}" for k, v in list(d["notes"].items())[:6])
-        print(f"    {d['name'] or gln} ({gln}): {notes}", flush=True)
+        tail = f"  [seneste C-række gælder til: {d['last']}]" if d["last"] else ""
+        print(f"    {d['name'] or gln} ({gln}): {notes}{tail}", flush=True)
 
 
 def read_json(path):
