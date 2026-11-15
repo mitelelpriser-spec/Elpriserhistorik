@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Henter tariffer og afgifter fra Energi Data Service (DatahubPricelist) – skånsomt, ét netselskab ad gangen:
+Henter tariffer og afgifter fra Energi Data Service (DatahubPricelist) – skånsomt, ét netselskab ad gangen (kører i sin egen workflow, se .github/workflows/tariffs.yml):
 
     data/grids.json                 liste over netselskaber (GLN, kode, navn, beskrivelse)
     data/tariffs/<GLN>.json         netselskabets C-tarif-rækker
@@ -25,12 +25,15 @@ API = "https://api.energidataservice.dk/dataset/DatahubPricelist"
 ENERGINET_GLN = "5790000432752"
 EN_CODES = ["EA-001", "40000", "41000"]
 OUT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data"))
-BACK_FULL = 730         # første gang: 2 år tilbage
+BACK_FULL = 3650        # første gang pr. selskab: langt tilbage, for DataHub søger på startdato og den gældende række kan være gammel
+KEEP_DAYS = 800         # gemte rækker, der sluttede for mere end 800 dage siden, kasseres
+META_BACK = 3650        # netselskabslisten bygges ud fra rækker op til 10 år tilbage
+GRIDS_VERSION = 2       # hæves, når listereglerne ændres (tvinger ny liste)
 BACK_INC = 60           # senere: kun 60 dage tilbage
 AHEAD = 120
 REFRESH_H = 6 * 24      # hver fil opdateres højst hver 6. dag
-SLEEP = 10.0            # pause mellem opslag
-BUDGET_S = 28 * 60      # stop pænt efter 28 minutter
+SLEEP = 70.0            # pause mellem opslag (Energi Data Service tillader ca. 1 opslag i minuttet)
+BUDGET_S = 95 * 60      # stop pænt efter 95 minutter (workflowet har 120 minutter)
 
 
 def http_json(url):
@@ -145,6 +148,32 @@ def build_grids(recs):
     return [{"gln": b["gln"], "code": b["code"], "name": b["name"], "desc": b["desc"]} for b in out]
 
 
+def prune(rows):
+    """Kasserer rækker, der sluttede for længe siden (de gældende rækker bliver, uanset hvor gamle de er)."""
+    cut = datetime.now() - timedelta(days=KEEP_DAYS)
+    return [r for r in rows if r["to"] is None or parse_dt(r["to"]) >= cut]
+
+
+def diagnose(recs, grids):
+    """Skriver til loggen, hvilke selskaber med takstposter der IKKE kom på listen, og hvilke noter de har."""
+    have = {g["gln"] for g in grids}
+    owners = {}
+    for o in recs:
+        gln = str(o.get("GLN_Number") or "")
+        if not gln or gln in have or gln == ENERGINET_GLN:
+            continue
+        d = owners.setdefault(gln, {"name": str(o.get("ChargeOwner") or "").strip(), "notes": {}})
+        n = str(o.get("Note") or "").strip()
+        d["notes"][n] = d["notes"].get(n, 0) + 1
+    if not owners:
+        print("  Alle selskaber med takstposter er med på listen.", flush=True)
+        return
+    print(f"  UDELADT fra listen ({len(owners)} selskaber har takstposter, men ingen 'Nettarif C'):", flush=True)
+    for gln, d in sorted(owners.items(), key=lambda kv: kv[1]["name"].lower()):
+        notes = ", ".join(f"{k or '(tom)'}×{v}" for k, v in list(d["notes"].items())[:6])
+        print(f"    {d['name'] or gln} ({gln}): {notes}", flush=True)
+
+
 def read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -185,17 +214,18 @@ def main():
         first_request = False
 
     # 1) netselskabslisten (kun hvis den mangler eller er over 6 dage gammel)
-    if gj and age_hours(gj) < REFRESH_H and len(gj.get("grids", [])) >= 10:
+    if gj and gj.get("v") == GRIDS_VERSION and age_hours(gj) < REFRESH_H and len(gj.get("grids", [])) >= 10:
         grids = gj["grids"]
         print(f"Netselskabslisten er frisk ({len(grids)} koder).", flush=True)
     else:
         print("Henter netselskaber …", flush=True)
         pause()
-        meta = query({"ChargeType": ["D03"]}, BACK_FULL, columns="GLN_Number,ChargeOwner,ChargeTypeCode,Note,Description,ValidFrom,ValidTo")
+        meta = query({"ChargeType": ["D03"]}, META_BACK, columns="GLN_Number,ChargeOwner,ChargeTypeCode,Note,Description,ValidFrom,ValidTo")
         grids = build_grids(meta)
+        diagnose(meta, grids)
         if len(grids) < 10:
             raise RuntimeError(f"Kun {len(grids)} netselskaber fundet – dataene ser forkerte ud, springer over.")
-        write_json(grids_path, {"updated": now_iso(), "grids": grids})
+        write_json(grids_path, {"v": GRIDS_VERSION, "updated": now_iso(), "grids": grids})
         print(f"  {len(grids)} netselskaber (koder).", flush=True)
 
     # 2) Energinet + hvert netselskab, ét opslag ad gangen
@@ -227,7 +257,7 @@ def main():
             failed.append(f"{name}: {e}")
             continue
         new_rows = [r for r in (to_row(x) for x in recs) if r]
-        rows = merge(old_rows, new_rows)
+        rows = prune(merge(old_rows, new_rows))
         if not rows:
             failed.append(f"{name}: ingen rækker")
             continue
