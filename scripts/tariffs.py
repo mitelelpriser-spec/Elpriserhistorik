@@ -28,7 +28,7 @@ OUT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 BACK_FULL = 3650        # første gang pr. selskab: langt tilbage, for DataHub søger på startdato og den gældende række kan være gammel
 KEEP_DAYS = 800         # gemte rækker, der sluttede for mere end 800 dage siden, kasseres
 META_BACK = 3650        # netselskabslisten bygges ud fra rækker op til 10 år tilbage
-GRIDS_VERSION = 6       # hæves, når listereglerne ændres (tvinger ny liste)
+GRIDS_VERSION = 7       # hæves, når listereglerne ændres (tvinger ny liste)
 BACK_INC = 60           # senere: kun 60 dage tilbage
 AHEAD = 120
 REFRESH_H = 6 * 24      # hver fil opdateres højst hver 6. dag
@@ -213,6 +213,36 @@ def diagnose_extra(recs, grids):
         print(f"    {name or gln} | {code} | note: {note[:40]} | {desc[:60]} | {str(frm)[:10]}→{str(to)[:10] if to else 'åben'}", flush=True)
 
 
+EXTRA_WORDS = ("overordnet net", "overliggende net", "nettarif 60 kv", "60kv net", "nettab", "nettarif - energinet", "regional nettarif")
+EXTRA_SKIP = ("indfødning", "produktion", "effektbetaling", "rådighed", "egenprod", "samplac", "kollektiv", "bruges ikke")
+
+
+def build_extras(recs, grids):
+    """Ekstra led hos selskaber på listen, som kan skulle lægges oven i C-tariffen (overordnet net, 60 kV, nettab ...).
+    Kun poster, der er gyldige nu. Det afgøres bagefter ud fra tallene, hvilke led der faktisk skal bruges."""
+    now = datetime.now()
+    glns = {g["gln"] for g in grids}
+    have = {(g["gln"], g["code"]) for g in grids}
+    best = {}
+    for o in recs:
+        gln = str(o.get("GLN_Number") or "")
+        code = str(o.get("ChargeTypeCode") or "").strip()
+        if gln not in glns or (gln, code) in have or not o.get("ValidFrom"):
+            continue
+        text = (str(o.get("Note") or "") + " " + str(o.get("Description") or "")).lower()
+        if not any(w in text for w in EXTRA_WORDS) or any(w in text for w in EXTRA_SKIP):
+            continue
+        frm = parse_dt(str(o["ValidFrom"]))
+        to = parse_dt(str(o["ValidTo"])) if o.get("ValidTo") else None
+        if frm > now or (to is not None and to <= now):
+            continue
+        key = (gln, code)
+        if key not in best or frm > best[key][0]:
+            best[key] = (frm, {"gln": gln, "code": code, "name": str(o.get("ChargeOwner") or "").strip(),
+                               "note": str(o.get("Note") or "").strip(), "desc": str(o.get("Description") or "").strip()})
+    return sorted((b[1] for b in best.values()), key=lambda e: (e["name"].lower(), e["code"]))
+
+
 def read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -255,6 +285,7 @@ def main():
     # 1) netselskabslisten (kun hvis den mangler eller er over 6 dage gammel)
     if gj and gj.get("v") == GRIDS_VERSION and age_hours(gj) < REFRESH_H and len(gj.get("grids", [])) >= 10:
         grids = gj["grids"]
+        extras = gj.get("extras", [])
         print(f"Netselskabslisten er frisk ({len(grids)} koder).", flush=True)
     else:
         print("Henter netselskaber …", flush=True)
@@ -272,9 +303,13 @@ def main():
         print(f"  {len(meta)} takstposter læst.", flush=True)
         diagnose(meta, grids)
         diagnose_extra(meta, grids)
+        extras = build_extras(meta, grids)
+        print(f"  EKSTRA led der hentes ({len(extras)}):", flush=True)
+        for e in extras:
+            print(f"    {e['name']} | {e['code']} | {e['note'][:45]}", flush=True)
         if len(grids) < 10:
             raise RuntimeError(f"Kun {len(grids)} netselskaber fundet – dataene ser forkerte ud, springer over.")
-        write_json(grids_path, {"v": GRIDS_VERSION, "updated": now_iso(), "grids": grids})
+        write_json(grids_path, {"v": GRIDS_VERSION, "updated": now_iso(), "grids": grids, "extras": extras})
         print(f"  {len(grids)} netselskaber (koder).", flush=True)
 
     # 2) Energinet + hvert netselskab, ét opslag ad gangen
@@ -284,6 +319,9 @@ def main():
     for g in grids:
         by_gln.setdefault(g["gln"], []).append(g["code"])
         names[g["gln"]] = g["name"]
+    for e in extras:   # ekstra led hentes sammen med selskabets øvrige koder (samme fil)
+        if e["code"] not in by_gln.get(e["gln"], []):
+            by_gln.setdefault(e["gln"], []).append(e["code"])
     for gln, codes in by_gln.items():
         jobs.append((gln, codes, os.path.join(tdir, f"{gln}.json"), names[gln]))
 
