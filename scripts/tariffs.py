@@ -28,7 +28,7 @@ OUT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 BACK_FULL = 3650        # første gang pr. selskab: langt tilbage, for DataHub søger på startdato og den gældende række kan være gammel
 KEEP_DAYS = 800         # gemte rækker, der sluttede for mere end 800 dage siden, kasseres
 META_BACK = 3650        # netselskabslisten bygges ud fra rækker op til 10 år tilbage
-GRIDS_VERSION = 5       # hæves, når listereglerne ændres (tvinger ny liste)
+GRIDS_VERSION = 6       # hæves, når listereglerne ændres (tvinger ny liste)
 BACK_INC = 60           # senere: kun 60 dage tilbage
 AHEAD = 120
 REFRESH_H = 6 * 24      # hver fil opdateres højst hver 6. dag
@@ -187,6 +187,32 @@ def diagnose(recs, grids):
         print(f"    {d['name'] or gln} ({gln}): {notes}{tail}", flush=True)
 
 
+def diagnose_extra(recs, grids):
+    """Skriver gældende poster for selskaber PÅ listen, som ikke er på listen (fx 'Nettarif 60 kV', 'overordnet net', 'regional').
+    Nogle selskaber har flere led, der skal lægges sammen; loggen viser, hvilke koder det drejer sig om."""
+    now = datetime.now()
+    have = {(g["gln"], g["code"]) for g in grids}
+    glns = {g["gln"] for g in grids}
+    seen = {}
+    for o in recs:
+        gln = str(o.get("GLN_Number") or "")
+        code = str(o.get("ChargeTypeCode") or "").strip()
+        if gln not in glns or (gln, code) in have or not o.get("ValidFrom"):
+            continue
+        frm = parse_dt(str(o["ValidFrom"]))
+        to = parse_dt(str(o["ValidTo"])) if o.get("ValidTo") else None
+        if frm > now or (to is not None and to <= now):
+            continue
+        key = (gln, code)
+        if key not in seen or frm > seen[key][0]:
+            seen[key] = (frm, to, str(o.get("ChargeOwner") or "").strip(), str(o.get("Note") or "").strip(), str(o.get("Description") or "").strip())
+    if not seen:
+        return
+    print(f"  ØVRIGE gældende poster hos selskaber på listen ({len(seen)}; kan være led, der skal lægges til):", flush=True)
+    for (gln, code), (frm, to, name, note, desc) in sorted(seen.items(), key=lambda kv: (kv[1][2].lower(), kv[0][1])):
+        print(f"    {name or gln} | {code} | note: {note[:40]} | {desc[:60]} | {str(frm)[:10]}→{str(to)[:10] if to else 'åben'}", flush=True)
+
+
 def read_json(path):
     try:
         with open(path, encoding="utf-8") as f:
@@ -245,6 +271,7 @@ def main():
         grids = build_grids(meta)
         print(f"  {len(meta)} takstposter læst.", flush=True)
         diagnose(meta, grids)
+        diagnose_extra(meta, grids)
         if len(grids) < 10:
             raise RuntimeError(f"Kun {len(grids)} netselskaber fundet – dataene ser forkerte ud, springer over.")
         write_json(grids_path, {"v": GRIDS_VERSION, "updated": now_iso(), "grids": grids})
