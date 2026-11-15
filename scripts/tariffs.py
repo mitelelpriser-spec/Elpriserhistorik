@@ -28,7 +28,7 @@ OUT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 BACK_FULL = 3650        # første gang pr. selskab: langt tilbage, for DataHub søger på startdato og den gældende række kan være gammel
 KEEP_DAYS = 800         # gemte rækker, der sluttede for mere end 800 dage siden, kasseres
 META_BACK = 3650        # netselskabslisten bygges ud fra rækker op til 10 år tilbage
-GRIDS_VERSION = 2       # hæves, når listereglerne ændres (tvinger ny liste)
+GRIDS_VERSION = 3       # hæves, når listereglerne ændres (tvinger ny liste)
 BACK_INC = 60           # senere: kun 60 dage tilbage
 AHEAD = 120
 REFRESH_H = 6 * 24      # hver fil opdateres højst hver 6. dag
@@ -220,8 +220,17 @@ def main():
     else:
         print("Henter netselskaber …", flush=True)
         pause()
-        meta = query({"ChargeType": ["D03"]}, META_BACK, columns="GLN_Number,ChargeOwner,ChargeTypeCode,Note,Description,ValidFrom,ValidTo")
+        cols = "GLN_Number,ChargeOwner,ChargeTypeCode,Note,Description,ValidFrom,ValidTo"
+        # Først de seneste 800 dage (virkede og gav 48 koder); derefter 10 år tilbage som tillæg, så selskaber med gamle gældende
+        # rækker kommer med. Svigter eller afkortes den lange forespørgsel, har vi stadig den korte.
+        meta = query({"ChargeType": ["D03"]}, 800, columns=cols)
+        try:
+            pause()
+            meta = meta + query({"ChargeType": ["D03"]}, META_BACK, columns=cols)
+        except Exception as e:  # noqa: BLE001
+            print(f"  Den lange forespørgsel (10 år) mislykkedes ({e}) – bruger kun de seneste 800 dage.", flush=True)
         grids = build_grids(meta)
+        print(f"  {len(meta)} takstposter læst.", flush=True)
         diagnose(meta, grids)
         if len(grids) < 10:
             raise RuntimeError(f"Kun {len(grids)} netselskaber fundet – dataene ser forkerte ud, springer over.")
