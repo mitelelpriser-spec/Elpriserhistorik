@@ -1,1 +1,33 @@
-{"name":"Opdater elpriser","on":{"schedule":[{"cron":"17 * * * *"}],"workflow_dispatch":{}},"permissions":{"contents":"write"},"jobs":{"update":{"runs-on":"ubuntu-latest","steps":[{"uses":"actions/checkout@v4"},{"uses":"actions/setup-python@v5","with":{"python-version":"3.12"}},{"name":"Hent priser","run":"python scripts/update.py"},{"name":"Gem aendringer","run":"git config user.name github-actions && git config user.email actions@users.noreply.github.com && git add -A && (git diff --cached --quiet || (git commit -m 'Opdater priser' && git push))"}]}}}
+name: Opdater elpriser
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hver time (GitHub kan forsinke kørslen en smule)
+  workflow_dispatch: {}     # kan også startes med hånden under fanen Actions
+
+permissions:
+  contents: write
+
+concurrency:
+  group: spotpriser
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Hent spotpriser
+        run: python scripts/update.py
+      - name: Gem ændringer
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "Opdater priser"
+          for i in 1 2 3; do git pull --rebase -q && git push && break || sleep 5; done
